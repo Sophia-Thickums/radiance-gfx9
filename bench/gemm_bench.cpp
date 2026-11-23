@@ -34,6 +34,12 @@ int main(int argc, char** argv) {
      * backtrace blames the memcpy rather than the load order. */
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev < 1) die("no HIP device");
+    /* hipGetDeviceCount alone does NOT settle the runtime: dlopen'ing a gfx900 code object while the
+     * runtime is still bringing its threads up segfaults intermittently inside libamdhip64, and only
+     * under gdb's slower start does it disappear. Allocate, free and synchronise first. */
+    { void* warm = nullptr;
+      if (hipMalloc(&warm, 4096) == hipSuccess) { hipFree(warm); }
+      hipDeviceSynchronize(); }
     std::printf("hip: %d device(s)\n", ndev);
 
     void* h = dlopen(so, RTLD_NOW | RTLD_LOCAL);

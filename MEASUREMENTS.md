@@ -234,3 +234,42 @@ So the honest position:
 None of that makes the kernels wrong. They are correct, they run on both cards, and they are the
 first device code this engine has ever had for gfx900. It makes the *bar* the thing to re-examine
 before another week goes into a number that the hardware will not give up.
+
+## 10. The fp16 path, tried and lost
+
+The one route with headroom was packed fp16 with chunked accumulation: 32 products land in a
+`__half2` accumulator, then the pair is widened into f32 registers — `v_pk_fma_f16` for the
+multiplies, f32 for the running sum. It compiled, it ran, and it was **worse on both axes**:
+
+| | ms at M=512 | TFLOP/s | worst rel_l2 |
+|---|---|---|---|
+| f32 tiled (selected) | 1.97 | 0.26 | 2.40e-04 |
+| packed fp16, chunked | 3.77 | 0.13 | 2.15e-03 |
+
+Slower despite the packed instruction (the compiler does emit `v_pk_fma_f16`, twice), and nine
+times less accurate. The likely cause of the slowness is alignment: with three columns a thread the
+`__half2` reads sit at odd 2-byte offsets and the hardware splits them. The aligned rewrite — four
+columns a thread, so every pair is 4-byte aligned — **faults the card** and was not chased further.
+
+**The row is not selected.** `gemm_nt` serves from the f32 tiled kernel. The fp16 kernel stays in the
+file as the record of a path that looked right on paper and lost on the hardware.
+
+## 11. Where the bar actually sits
+
+Put together, the arithmetic from §9 and §10 says:
+
+- The 1.3x bar is **91% of this card's f32 peak**. Not a kernel anyone hand-writes.
+- The only route above f32 is packed fp16, and this shape's fp16 version measured **slower**.
+- So on this shape, on this card, a hand-written `gemm_nt` does not beat llama.cpp's Vulkan.
+
+That is a negative result and it is worth having: it is the first time the question was asked of the
+hardware rather than of a document. The kernels that do exist are correct, they run on both gfx900
+cards, and they are the first device code this engine has ever had for the architecture.
+
+## 12. The bench harness is flaky outside a debugger
+
+`bench/gemm_bench.cpp` segfaults inside `libamdhip64.so` on most plain runs and runs perfectly under
+`gdb` or `stdbuf`, with identical inputs and the same binary. `hipGetDeviceCount`, a warm
+malloc/free and a `hipDeviceSynchronize` before `dlopen` do **not** settle it. The numbers in this
+file were taken where it ran; treat the harness as a scratch instrument, not a deliverable, until
+that startup race is understood. The engine itself loads the same `.so` without trouble.

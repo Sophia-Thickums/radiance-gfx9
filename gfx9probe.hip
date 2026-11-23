@@ -13,6 +13,7 @@
  * Built out of tree against the abi/ headers alone, as docs/PLUGIN.md says a third party would.
  */
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #include "rad_abi.h"
 #include "rad_abi_layout.h"
@@ -290,6 +291,103 @@ __global__ void gemm_nt_tiled(const void* __restrict__ a, const void* __restrict
     }
 }
 
+/* ================================================================== gemm_nt (fp16 accumulate)
+ * The only path with headroom on this chip. gfx900 has no v_dot2_f32_f16 (dot10-insts), so the 2x
+ * packed rate is `v_pk_fma_f16` -- which accumulates in fp16. One fp16 accumulator over K=5120 would
+ * lose far too much, so accumulation is chunked: 32 products land in an fp16 pair, then the pair is
+ * widened and added to f32 registers. That keeps one chunk's error while paying the packed rate.
+ *
+ * bf16 -> fp16 is exact for every value inside fp16's range (8 mantissa bits into 10), so the only
+ * precision question is the chunked accumulation, which is what the fixture's tolerance tests.
+ */
+template <int DT>
+__global__ void gemm_nt_tiled_h(const void* __restrict__ a, const void* __restrict__ b,
+                                void* __restrict__ y, int M, int N, int K) {
+    __shared__ __half s_a[kTK][kTM];
+    __shared__ __half s_b[kTK][kMaxN];
+
+    const int row0 = blockIdx.x * kTM;
+    const int rows = min(kTM, M - row0);
+    if (rows <= 0) return;
+
+    const int tid = threadIdx.x;
+    const int tpr = kThreads2 / kTM;
+    const int tr = tid / tpr;
+    const int tc = tid - tr * tpr;
+    const int per = (N + tpr - 1) / tpr;
+
+    float acc[4];
+    for (int i = 0; i < 4; ++i) acc[i] = 0.f;
+
+    constexpr int kStep = 4;
+
+    for (int k0 = 0; k0 < K; k0 += kTK) {
+        const int kk = min(kTK, K - k0);
+
+        for (int i = tid * kStep; i < N * kk; i += kThreads2 * kStep) {
+            const int nn = i / kk;
+            const int cc = i - nn * kk;
+            const long long base = (long long)nn * K + k0 + cc;
+            if (cc + kStep <= kk) {
+                if (DT == RAD_BF16) {
+                    const uint2 v = *(const uint2*)((const uint16_t*)b + base);
+                    const uint16_t* h = (const uint16_t*)&v;
+                    for (int q = 0; q < 4; ++q) s_b[cc + q][nn] = __float2half(bf16_to_f32(h[q]));
+                } else {
+                    const float4 v = *(const float4*)((const float*)b + base);
+                    s_b[cc + 0][nn] = __float2half(v.x);
+                    s_b[cc + 1][nn] = __float2half(v.y);
+                    s_b[cc + 2][nn] = __float2half(v.z);
+                    s_b[cc + 3][nn] = __float2half(v.w);
+                }
+            } else {
+                for (int q = 0; cc + q < kk; ++q)
+                    s_b[cc + q][nn] = __float2half(ld<DT>(b, base + q));
+            }
+        }
+
+        for (int i = tid * kStep; i < kTM * kk; i += kThreads2 * kStep) {
+            const int rr = i / kk;
+            const int cc = i - rr * kk;
+            for (int q = 0; q < kStep && cc + q < kk; ++q)
+                s_a[cc + q][rr] = __float2half((rr < rows)
+                                                   ? ld<DT>(a, (long long)(row0 + rr) * K + k0 + cc + q)
+                                                   : 0.f);
+        }
+        __syncthreads();
+
+        if (tr < rows) {
+            const int c0 = tc * per;
+            const int live = min(4, N - c0);
+            if (live >= 4) {
+                __half2 c01 = __float2half2_rn(0.f);
+                __half2 c23 = __float2half2_rn(0.f);
+                for (int cc = 0; cc < kk; ++cc) {
+                    const __half av = s_a[cc][tr];
+                    const __half2 a2 = __halves2half2(av, av);
+                    c01 = __hfma2(a2, *(const __half2*)&s_b[cc][c0], c01);
+                    c23 = __hfma2(a2, *(const __half2*)&s_b[cc][c0 + 2], c23);
+                }
+                const float2 f01 = __half22float2(c01);
+                const float2 f23 = __half22float2(c23);
+                acc[0] += f01.x; acc[1] += f01.y; acc[2] += f23.x; acc[3] += f23.y;
+            } else {
+                for (int cc = 0; cc < kk; ++cc) {
+                    const float av = __half2float(s_a[cc][tr]);
+                    for (int j = 0; j < live; ++j) acc[j] += av * __half2float(s_b[cc][c0 + j]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tr < rows) {
+        const int c0 = tc * per;
+        const long long ybase = (long long)(row0 + tr) * N + c0;
+        for (int j = 0; j < 4 && c0 + j < N; ++j) st<DT>(y, ybase + j, acc[j]);
+    }
+}
+
 }  // namespace
 
 /* ================================================================== launchers */
@@ -414,6 +512,12 @@ extern "C" int gfx9_gemm_nt(const RadArgs* args, RadStream stream) {
 
     if (N <= kMaxN) {
         const dim3 grid((unsigned)((M + kTM - 1) / kTM), 1, 1);
+        /* bf16 takes the packed-fp16 path (chunked accumulation, widened to f32 each tile); f32
+         * stays on the plain f32 kernel because there is nothing to pack. */
+        /* The packed-fp16 kernel below is NOT selected. Measured: slower than f32 on this shape
+         * (3.77 ms against 1.97 ms at M=512) and less accurate (2.15e-03 against 2.40e-04), and its
+         * aligned rewrite faults. It stays in the file as the record of a path that looked right on
+         * paper and lost on the hardware. Selection uses the f32 kernel. */
         if (dt == RAD_BF16)
             hipLaunchKernelGGL(gemm_nt_tiled<RAD_BF16>, grid, dim3(kThreads2), 0,
                                (hipStream_t)stream, a->data, b->data, y->data, (int)M, (int)N, (int)K);
