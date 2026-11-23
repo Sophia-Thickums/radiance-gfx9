@@ -40,13 +40,31 @@ So:
 
 That is the whole claim. A real gfx900 library is now a question of work, not of possibility.
 
+## What is in it now
+
+Six rows, all verified on both gfx900 cards in the machine this was written on:
+
+| op | state |
+|---|---|
+| `add` | bit-exact |
+| `silu_mul` | bit-exact to M=32, 5.4e-06 at M=64 |
+| `rmsnorm` | bit-exact to M=128, 1.3e-05 at M=512 |
+| `gemm_nt` | bit-exact |
+| `gather_rows` | exact |
+| `cast` | exact |
+
+`rope`, `attn_paged`, `kv_store` and `logits_gemm` are not written yet — `IMPLEMENTATION.md` carries
+the design for them, including the one that decides whether a model can run at all.
+
 ## Files
 
 | file | what |
 |---|---|
-| `gfx9probe.hip` | the library: one `add` row, bf16 + f32, plus the bf16 conversions done the way gfx900 requires |
+| `gfx9probe.hip` | the library |
 | `build.sh` | builds `libgfx9probe.so` for `gfx900` |
+| `IMPLEMENTATION.md` | how to write the remaining rows: the oracle's contract, the hardware's limits, and the traps |
 | `MEASUREMENTS.md` | every number, the exact commands, and what was ruled out |
+| `bench/gemm_bench.cpp` | times a shipped kernel from outside the engine (scratch instrument — see §12) |
 
 ## Build and run
 
