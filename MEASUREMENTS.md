@@ -135,3 +135,27 @@ is closer to the reference than the engine's own host library.
   `dtype IN "f32"`, and every `add` case in the fixture is bf16, so the row was never selected and
   the run still passed. A passing benchmark that never ran your kernel proves nothing; read the
   `run` column, not only the pass count.
+
+## 7. The same library on the Vega Frontier Edition
+
+Both gfx900 cards in this machine were run, not just the Instinct. The library is built for the
+architecture (`gfx900`), so it should serve both — but that is a claim, so it was measured.
+
+```
+ROCR_VISIBLE_DEVICES=2 rad-kbench --kernels gfx9probe:libref:libavx
+I device: AQL backend, 1 device(s) [0:gfx900]
+
+| `gfx9probe` | 0.2.0 | device | 3 | 3 of 3 | 3 of 254 | 3 of 40 | 57 | 57 | 0 | 2.40e-04 |
+```
+
+Identical to the Instinct MI25 row: **3 of 3 rows ran, 57 of 57 cases passed, 0 failed**.
+
+```
+card                              rows  cases  pass  fail  worst rel_l2
+Instinct MI25      (09:00.0)      3/3     57    57     0    2.40e-04
+Vega Frontier Ed.  (11:00.0)      3/3     57    57     0    2.40e-04
+```
+
+Device order on this machine, for anyone repeating it: `0` gfx1201 (RX 9070 XT), `1` gfx900
+(Instinct MI25), `2` gfx900 (Vega Frontier Edition), `3` gfx1036 (iGPU). The Vega runs the desktop,
+so it carries ~800 MiB of display memory during the run; that did not change the result.
