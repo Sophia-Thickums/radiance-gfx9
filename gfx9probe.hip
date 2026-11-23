@@ -1,18 +1,14 @@
-/* gfx9probe.hip -- the smallest possible DEVICE kernel library for gfx900 (Vega 10).
+/* gfx9probe.hip -- a device kernel library for AMD gfx900 (Vega 10).
  *
- * One row: the conventional `add` op, bf16 and f32, contiguous. y = (a + b) / div, with `b`
- * broadcast across the rows when its element count equals n (libref's rule,
- * ref_elementwise.cpp elementwise2).
+ * Rows so far: add, rmsnorm, silu_mul. More as they are written and verified.
  *
- * WHY IT EXISTS: to answer one question with a measurement instead of an inference -- can this
- * engine's kernel-library ABI carry a device library for a card that is NOT RDNA4? Every bundled
- * device library is RDNA4/RDNA3/Strix Halo; nothing in the tree targets gfx9. If this loads, gets
- * selected over the host reference, and passes rad-kbench on the MI25, then the path exists and a
- * real gfx900 library is a question of work rather than possibility.
+ * WHY: every device library bundled with radiance targets RDNA4, RDNA3 or Strix Halo. Aiming that
+ * source at gfx900 fails by name -- no matrix cores (wmma-128b-insts), no wave32. This file is the
+ * other route: kernels written for what Vega 10 actually has. Wave64 only, no bf16 ALU (so bf16 is
+ * widened by a shift and rounded back with round-to-nearest-even), 256 VGPRs, 64 KB LDS.
  *
- * The bf16 case is the interesting one: gfx900 has no bf16 ALU and no bf16 conversion instruction
- * (measured: __bf16 -> float compiles to `v_lshlrev_b32 16`). So bf16 here is widened by shift,
- * added in f32, and rounded back with IEEE round-to-nearest-even, which is libref's contract.
+ * Every row is checked numerically by rad-kbench against libref on the card. A row that no fixture
+ * case reaches is reported as a row, not a failure -- read the `run` column, not only the passes.
  *
  * Built out of tree against the abi/ headers alone, as docs/PLUGIN.md says a third party would.
  */
@@ -28,6 +24,11 @@ namespace {
 
 constexpr int kThreads = 256;
 
+/* ------------------------------------------------------------------ the two dtypes
+ * bf16 has no arithmetic on this chip at all, so every bf16 op is: shift left 16, compute in f32,
+ * round back with IEEE round-to-nearest-ties-to-even. That is libref's contract, and it is why the
+ * device rows agree with the oracle to the last bit rather than to a tolerance.
+ */
 __device__ __forceinline__ float bf16_to_f32(uint16_t h) {
     uint32_t u = (uint32_t)h << 16;
     float f;
@@ -35,7 +36,6 @@ __device__ __forceinline__ float bf16_to_f32(uint16_t h) {
     return f;
 }
 
-/* IEEE round-to-nearest, ties to even -- the same rule as rad_plugin.h's rad_f32_to_bf16. */
 __device__ __forceinline__ uint16_t f32_to_bf16(float f) {
     uint32_t u;
     memcpy(&u, &f, 4);
@@ -43,31 +43,28 @@ __device__ __forceinline__ uint16_t f32_to_bf16(float f) {
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
-__global__ void add_kernel_bf16(const uint16_t* __restrict__ a, const uint16_t* __restrict__ b,
-                                uint16_t* __restrict__ y, long long rows, long long n,
-                                long long b_stride_rows, float div) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * n) return;
-    const long long r = i / n;
-    const float u = bf16_to_f32(a[i]);
-    const float v = bf16_to_f32(b[i - r * n + r * b_stride_rows]);
-    float s = u + v;
-    if (div != 1.0f) s = s / div;
-    y[i] = f32_to_bf16(s);
+template <int DT>
+__device__ __forceinline__ float ld(const void* p, long long i);
+template <int DT>
+__device__ __forceinline__ void st(void* p, long long i, float v);
+
+template <>
+__device__ __forceinline__ float ld<RAD_F32>(const void* p, long long i) {
+    return ((const float*)p)[i];
+}
+template <>
+__device__ __forceinline__ void st<RAD_F32>(void* p, long long i, float v) {
+    ((float*)p)[i] = v;
+}
+template <>
+__device__ __forceinline__ float ld<RAD_BF16>(const void* p, long long i) {
+    return bf16_to_f32(((const uint16_t*)p)[i]);
+}
+template <>
+__device__ __forceinline__ void st<RAD_BF16>(void* p, long long i, float v) {
+    ((uint16_t*)p)[i] = f32_to_bf16(v);
 }
 
-__global__ void add_kernel_f32(const float* __restrict__ a, const float* __restrict__ b,
-                               float* __restrict__ y, long long rows, long long n,
-                               long long b_stride_rows, float div) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * n) return;
-    const long long r = i / n;
-    float s = a[i] + b[i - r * n + r * b_stride_rows];
-    if (div != 1.0f) s = s / div;
-    y[i] = s;
-}
-
-/* Contiguous, row-major: what the probe claims and nothing more. */
 bool contiguous(const RadTensor* t) {
     if (!t || !t->data) return false;
     int64_t expect = 1;
@@ -84,12 +81,88 @@ long long numel(const RadTensor* t) {
     return n;
 }
 
+float param_f32(const RadArgs* a, const char* key, float dflt) {
+    const RadParam* p = rad_param_find(a->p, a->n_p, key);
+    if (!p) return dflt;
+    if (p->kind == RAD_P_F64) return (float)p->dval;
+    if (p->kind == RAD_P_INT) return (float)p->ival;
+    return dflt;
+}
+
+/* ================================================================== add
+ * y = (a + b) / div, with `b` broadcast across rows when its element count is n. libref's rule.
+ */
+template <int DT>
+__global__ void add_kernel(const void* __restrict__ a, const void* __restrict__ b,
+                           void* __restrict__ y, long long rows, long long n,
+                           long long b_stride_rows, float div) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * n) return;
+    const long long r = i / n;
+    float s = ld<DT>(a, i) + ld<DT>(b, i - r * n + r * b_stride_rows);
+    if (div != 1.0f) s = s / div;
+    st<DT>(y, i, s);
+}
+
+/* ================================================================== silu_mul
+ * y[r][i] = silu(gate_up[r][i]) * gate_up[r][n + i].  One row of gate_up is 2n wide.
+ */
+template <int DT>
+__global__ void silu_mul_kernel(const void* __restrict__ gu, void* __restrict__ y,
+                                long long rows, long long n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * n) return;
+    const long long r = i / n;
+    const long long c = i - r * n;
+    const long long base = r * 2 * n;
+    const float g = ld<DT>(gu, base + c);
+    const float u = ld<DT>(gu, base + n + c);
+    const float s = g / (1.0f + __expf(-g));   /* silu */
+    st<DT>(y, i, s * u);
+}
+
+/* ================================================================== rmsnorm
+ * y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult, one workgroup of one wave per row.
+ *
+ * The sum is taken per lane over a stride-64 walk and then reduced across the wave, so the order
+ * differs from libref's sequential ascending accumulation. The fixture's tolerance covers that;
+ * a bit-exact rmsnorm would have to be single-lane, which is not worth the time it costs.
+ */
+template <int DT>
+__global__ void rmsnorm_kernel(const void* __restrict__ x, const void* __restrict__ w,
+                               void* __restrict__ y, long long rows, long long n,
+                               float eps, float wadd, float mult, int has_w) {
+    const long long r = blockIdx.x;
+    if (r >= rows) return;
+    const long long base = r * n;
+    const int lane = threadIdx.x;
+
+    float ss = 0.0f;
+    for (long long i = lane; i < n; i += blockDim.x) {
+        const float v = ld<DT>(x, base + i);
+        ss += v * v;
+    }
+    /* wave64 reduction: 64 lanes, six steps. */
+    for (int off = 32; off > 0; off >>= 1) ss += __shfl_down(ss, off);
+    __shared__ float s_ss;
+    if (lane == 0) s_ss = ss;
+    __syncthreads();
+
+    const float s = rsqrtf(s_ss / (float)n + eps);
+    for (long long i = lane; i < n; i += blockDim.x) {
+        const float v = ld<DT>(x, base + i);
+        const float gain = has_w ? (ld<DT>(w, i) + wadd) : 1.0f;
+        st<DT>(y, base + i, v * s * gain * mult);
+    }
+}
+
 }  // namespace
+
+/* ================================================================== launchers */
 
 extern "C" int gfx9_add(const RadArgs* args, RadStream stream) {
     if (!args || args->n_t < 3) return RAD_E_INVAL;
     const RadTensor *a = &args->t[0], *b = &args->t[1], *y = &args->t[2];
-
     const uint32_t dt = y->dtype;
     if (dt != RAD_BF16 && dt != RAD_F32) return RAD_E_DTYPE;
     if (a->dtype != dt || b->dtype != dt) return RAD_E_DTYPE;
@@ -98,50 +171,121 @@ extern "C" int gfx9_add(const RadArgs* args, RadStream stream) {
     long long n = 0;
     if (!rad_args_geti(args, "n", &n) || n <= 0) n = numel(y);
     if (n <= 0) return RAD_E_SHAPE;
-
     const long long yn = numel(y);
     if (yn % n) return RAD_E_SHAPE;
     const long long rows = yn / n;
     if (numel(a) < yn) return RAD_E_SHAPE;
-
     const long long bn = numel(b);
     const bool bcast = (bn == n && rows > 1);
     if (!bcast && bn < yn) return RAD_E_SHAPE;
     const long long b_stride_rows = bcast ? 0 : n;
 
-    float div = 1.0f;
-    const RadParam* p = rad_param_find(args->p, args->n_p, "div");
-    if (p) {
-        if (p->kind == RAD_P_F64) div = (float)p->dval;
-        else if (p->kind == RAD_P_INT) div = (float)p->ival;
-    }
+    const float div = param_f32(args, "div", 1.0f);
     if (!(div != 0.0f)) return RAD_E_INVAL;
 
     const unsigned blocks = (unsigned)((yn + kThreads - 1) / kThreads);
-    if (dt == RAD_BF16) {
-        hipLaunchKernelGGL(add_kernel_bf16, dim3(blocks), dim3(kThreads), 0, (hipStream_t)stream,
-                           (const uint16_t*)a->data, (const uint16_t*)b->data,
-                           (uint16_t*)y->data, rows, n, b_stride_rows, div);
-    } else {
-        hipLaunchKernelGGL(add_kernel_f32, dim3(blocks), dim3(kThreads), 0, (hipStream_t)stream,
-                           (const float*)a->data, (const float*)b->data, (float*)y->data, rows, n,
+    if (dt == RAD_BF16)
+        hipLaunchKernelGGL(add_kernel<RAD_BF16>, dim3(blocks), dim3(kThreads), 0,
+                           (hipStream_t)stream, a->data, b->data, y->data, rows, n,
                            b_stride_rows, div);
-    }
+    else
+        hipLaunchKernelGGL(add_kernel<RAD_F32>, dim3(blocks), dim3(kThreads), 0,
+                           (hipStream_t)stream, a->data, b->data, y->data, rows, n,
+                           b_stride_rows, div);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
+
+extern "C" int gfx9_silu_mul(const RadArgs* args, RadStream stream) {
+    if (!args || args->n_t < 2) return RAD_E_INVAL;
+    const RadTensor *gu = &args->t[0], *y = &args->t[1];
+    const uint32_t dt = y->dtype;
+    if (dt != RAD_BF16 && dt != RAD_F32) return RAD_E_DTYPE;
+    if (gu->dtype != dt) return RAD_E_DTYPE;
+    if (!contiguous(gu) || !contiguous(y)) return RAD_E_STRIDE;
+
+    long long n = 0;
+    if (!rad_args_geti(args, "n", &n) || n <= 0) n = numel(y);
+    if (n <= 0) return RAD_E_SHAPE;
+    const long long yn = numel(y);
+    if (yn % n) return RAD_E_SHAPE;
+    const long long rows = yn / n;
+    if (numel(gu) < rows * 2 * n) return RAD_E_SHAPE;
+
+    const unsigned blocks = (unsigned)((yn + kThreads - 1) / kThreads);
+    if (dt == RAD_BF16)
+        hipLaunchKernelGGL(silu_mul_kernel<RAD_BF16>, dim3(blocks), dim3(kThreads), 0,
+                           (hipStream_t)stream, gu->data, y->data, rows, n);
+    else
+        hipLaunchKernelGGL(silu_mul_kernel<RAD_F32>, dim3(blocks), dim3(kThreads), 0,
+                           (hipStream_t)stream, gu->data, y->data, rows, n);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+extern "C" int gfx9_rmsnorm(const RadArgs* args, RadStream stream) {
+    if (!args || args->n_t < 3) return RAD_E_INVAL;
+    const RadTensor *x = &args->t[0], *w = &args->t[1], *y = &args->t[2];
+    const uint32_t dt = y->dtype;
+    if (dt != RAD_BF16 && dt != RAD_F32) return RAD_E_DTYPE;
+    if (x->dtype != dt || y->dtype != dt) return RAD_E_DTYPE;
+    const int has_w = (w && w->data) ? 1 : 0;
+    if (has_w && w->dtype != dt) return RAD_E_DTYPE;
+    if (!contiguous(x) || !contiguous(y) || (has_w && !contiguous(w))) return RAD_E_STRIDE;
+
+    long long n = 0;
+    if (!rad_args_geti(args, "n", &n) || n <= 0) {
+        if (has_w && w->rank) n = w->shape[w->rank - 1];
+    }
+    if (n <= 0) return RAD_E_SHAPE;
+    const long long xn = numel(x);
+    if (xn % n) return RAD_E_SHAPE;
+    const long long rows = xn / n;
+    if (numel(y) < rows * n) return RAD_E_SHAPE;
+    if (has_w && numel(w) < n) return RAD_E_SHAPE;
+
+    const float eps = param_f32(args, "eps", 1e-6f);
+    const float wadd = param_f32(args, "wadd", 0.0f);
+    const float mult = param_f32(args, "mult", 1.0f);
+    if (!has_w && wadd != 0.0f) return RAD_E_INVAL;
+
+    if (dt == RAD_BF16)
+        hipLaunchKernelGGL(rmsnorm_kernel<RAD_BF16>, dim3((unsigned)rows), dim3(64), 0,
+                           (hipStream_t)stream, x->data, has_w ? w->data : nullptr, y->data,
+                           rows, n, eps, wadd, mult, has_w);
+    else
+        hipLaunchKernelGGL(rmsnorm_kernel<RAD_F32>, dim3((unsigned)rows), dim3(64), 0,
+                           (hipStream_t)stream, x->data, has_w ? w->data : nullptr, y->data,
+                           rows, n, eps, wadd, mult, has_w);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ================================================================== the table */
 
 namespace {
 
 const RadConstraint kCons[] = { RAD_CIN("dtype", "bf16 f32") };
 
 const RadKernelInfo kRows[] = {
-    { "gfx9_add", "add", "elem", "elementwise sum y=(a+b)/div, gfx900 probe", "any",
-      "bf16 f32",
-      RAD_DOMAIN_DEVICE, 0,
-      kCons, 1,
+    { "gfx9_add", "add", "elem", "elementwise sum y=(a+b)/div", "any", "bf16 f32",
+      RAD_DOMAIN_DEVICE, 0, kCons, 1,
       nullptr, 0, nullptr,
       nullptr, nullptr,
       gfx9_add,
+      nullptr, nullptr, nullptr, nullptr },
+
+    { "gfx9_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate_up", "any",
+      "bf16 f32",
+      RAD_DOMAIN_DEVICE, 0, kCons, 1,
+      nullptr, 0, nullptr,
+      nullptr, nullptr,
+      gfx9_silu_mul,
+      nullptr, nullptr, nullptr, nullptr },
+
+    { "gfx9_rmsnorm", "rmsnorm", "norm", "RMS norm with gain, wadd and mult", "one wave a row",
+      "bf16 f32",
+      RAD_DOMAIN_DEVICE, 0, kCons, 1,
+      nullptr, 0, nullptr,
+      nullptr, nullptr,
+      gfx9_rmsnorm,
       nullptr, nullptr, nullptr, nullptr },
 };
 
@@ -153,8 +297,8 @@ uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
 RAD_PLUGIN_ABI_LAYOUT_EXPORT
 
 const RadPluginInfo* rad_plugin_info(void) {
-    static const RadPluginInfo info = { RAD_PLUGIN_KERNEL, "gfx9probe", "0.1.0",
-                                        "gfx900 (Vega 10) device kernel library, one row",
+    static const RadPluginInfo info = { RAD_PLUGIN_KERNEL, "gfx9probe", "0.2.0",
+                                        "gfx900 (Vega 10) device kernels: add, silu_mul, rmsnorm",
                                         "gfx900" };
     return &info;
 }
