@@ -1,2 +1,3 @@
 libgfx9probe.so
+libgfx9probe.so.0.*
 *.o
