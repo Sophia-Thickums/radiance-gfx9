@@ -156,6 +156,46 @@ __global__ void rmsnorm_kernel(const void* __restrict__ x, const void* __restric
     }
 }
 
+/* ================================================================== gemm_nt
+ * y[M,N] = a[M,K] @ b[N,K]^T, with b stored N-major and K contiguous (the natural weight layout).
+ *
+ * First version: correct before fast. One thread owns four consecutive outputs along N, so each
+ * `a` element it loads feeds four FMAs and the k-loop carries four f32 accumulators. No LDS
+ * staging yet -- that is the optimisation pass, and it will be measured against this rather than
+ * replacing it blind.
+ */
+template <int DT>
+__global__ void gemm_nt_kernel(const void* __restrict__ a, const void* __restrict__ b,
+                               void* __restrict__ y, int M, int N, int K, int n4) {
+    const int row = blockIdx.y;
+    const int col4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col4 >= n4) return;
+    const int n0 = col4 * 4;
+
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    const long long abase = (long long)row * K;
+    const long long b0 = (long long)(n0 + 0) * K;
+    const long long b1 = (long long)(n0 + 1) * K;
+    const long long b2 = (long long)(n0 + 2) * K;
+    const long long b3 = (long long)(n0 + 3) * K;
+
+    const int rem = N - n0;   /* 1..4 live columns in this group */
+
+    for (int k = 0; k < K; ++k) {
+        const float av = ld<DT>(a, abase + k);
+        acc0 += av * ld<DT>(b, b0 + k);
+        if (rem > 1) acc1 += av * ld<DT>(b, b1 + k);
+        if (rem > 2) acc2 += av * ld<DT>(b, b2 + k);
+        if (rem > 3) acc3 += av * ld<DT>(b, b3 + k);
+    }
+
+    const long long ybase = (long long)row * N + n0;
+    st<DT>(y, ybase + 0, acc0);
+    if (rem > 1) st<DT>(y, ybase + 1, acc1);
+    if (rem > 2) st<DT>(y, ybase + 2, acc2);
+    if (rem > 3) st<DT>(y, ybase + 3, acc3);
+}
+
 }  // namespace
 
 /* ================================================================== launchers */
@@ -258,7 +298,35 @@ extern "C" int gfx9_rmsnorm(const RadArgs* args, RadStream stream) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-/* ================================================================== the table */
+extern "C" int gfx9_gemm_nt(const RadArgs* args, RadStream stream) {
+    if (!args || args->n_t < 3) return RAD_E_INVAL;
+    const RadTensor *a = &args->t[0], *b = &args->t[1], *y = &args->t[2];
+    const uint32_t dt = y->dtype;
+    if (dt != RAD_BF16 && dt != RAD_F32) return RAD_E_DTYPE;
+    if (a->dtype != dt || b->dtype != dt) return RAD_E_DTYPE;
+    if (!contiguous(a) || !contiguous(b) || !contiguous(y)) return RAD_E_STRIDE;
+
+    long long M = 0, N = 0, K = 0;
+    if (!rad_args_geti(args, "M", &M)) M = y->rank ? y->shape[0] : 0;
+    if (!rad_args_geti(args, "N", &N) || N <= 0) N = y->rank ? y->shape[y->rank - 1] : 0;
+    if (!rad_args_geti(args, "K", &K) || K <= 0) K = b->rank ? b->shape[b->rank - 1] : 0;
+    if (M <= 0 || N <= 0 || K <= 0) return RAD_E_SHAPE;
+    if (M > 65535) return RAD_E_SHAPE;
+    if (numel(a) < M * K) return RAD_E_SHAPE;
+    if (numel(b) < N * K) return RAD_E_SHAPE;
+    if (numel(y) < M * N) return RAD_E_SHAPE;
+
+    const int n4 = (int)((N + 3) / 4);
+    const int threads = 96;                      /* 24 groups of 4 columns: one block covers N<=96 */
+    const dim3 grid((unsigned)((n4 + threads - 1) / threads), (unsigned)M, 1);
+    if (dt == RAD_BF16)
+        hipLaunchKernelGGL(gemm_nt_kernel<RAD_BF16>, grid, dim3(threads), 0, (hipStream_t)stream,
+                           a->data, b->data, y->data, (int)M, (int)N, (int)K, n4);
+    else
+        hipLaunchKernelGGL(gemm_nt_kernel<RAD_F32>, grid, dim3(threads), 0, (hipStream_t)stream,
+                           a->data, b->data, y->data, (int)M, (int)N, (int)K, n4);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
 
 namespace {
 
@@ -286,6 +354,15 @@ const RadKernelInfo kRows[] = {
       nullptr, 0, nullptr,
       nullptr, nullptr,
       gfx9_rmsnorm,
+      nullptr, nullptr, nullptr, nullptr },
+
+    { "gfx9_gemm_nt", "gemm_nt", "gemm", "y = a @ b^T, four outputs a thread, f32 accumulate",
+      "M any, N any, K any",
+      "bf16 f32",
+      RAD_DOMAIN_DEVICE, 0, kCons, 1,
+      nullptr, 0, nullptr,
+      nullptr, nullptr,
+      gfx9_gemm_nt,
       nullptr, nullptr, nullptr, nullptr },
 };
 

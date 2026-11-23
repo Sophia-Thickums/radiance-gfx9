@@ -159,3 +159,41 @@ Vega Frontier Ed.  (11:00.0)      3/3     57    57     0    2.40e-04
 Device order on this machine, for anyone repeating it: `0` gfx1201 (RX 9070 XT), `1` gfx900
 (Instinct MI25), `2` gfx900 (Vega Frontier Edition), `3` gfx1036 (iGPU). The Vega runs the desktop,
 so it carries ~800 MiB of display memory during the run; that did not change the result.
+
+## 8. gemm_nt — correct, and nowhere near fast yet
+
+The first `gemm_nt` row passes every fixture case and is **bit-exact** (`rel_l2 0.00e+00`), because its
+k-loop accumulates in ascending order exactly as the reference does. Correctness first; this section
+is the speed, measured with `bench/gemm_bench.cpp`, which loads the built `.so` with `dlopen` and
+times the shipped kernel with HIP events rather than a copy of it.
+
+`N=96 K=5120 bf16`, on the Instinct MI25:
+
+```
+     M         ms      TFLOP/s        GFLOP
+     1     5.5788         0.00        0.001
+    16     5.6651         0.00        0.016
+    64     8.5777         0.01        0.063
+   256     8.8236         0.03        0.252
+   512     8.9989         0.06        0.503
+```
+
+**~0.06 TFLOP/s at M=512, against a card that can do ~12.3 TFLOP/s of f32 and ~24.6 of packed fp16.**
+That is roughly 0.3% of the f32 peak. For scale: llama.cpp's Vulkan prefill on this same card
+sustains about **8.6 TFLOP/s** on a 9B model, so this kernel is about **150× short** of the thing it
+has to beat.
+
+Two causes, both structural rather than tuning:
+
+1. **No reuse.** Two global loads per FMA, nothing staged in LDS, nothing register-blocked.
+2. **Occupancy.** At small M the grid is a single workgroup — one CU out of 64 — so 98% of the card
+   is idle before the arithmetic even starts.
+
+Both are what the tiled design fixes. This number is the honest starting line, not the result.
+
+### A trap worth writing down
+
+`dlopen`ing a radiance kernel library **before** the HIP runtime is initialised makes the first
+`hipMemcpy` segfault inside `libamdhip64.so.7`, with a backtrace that blames the memcpy and says
+nothing about the load order. Call `hipGetDeviceCount()` first. Reproduced in isolation, both ways,
+before it was believed.
