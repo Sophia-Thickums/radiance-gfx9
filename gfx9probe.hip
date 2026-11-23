@@ -196,6 +196,100 @@ __global__ void gemm_nt_kernel(const void* __restrict__ a, const void* __restric
     if (rem > 3) st<DT>(y, ybase + 3, acc3);
 }
 
+/* ================================================================== gemm_nt (tiled)
+ * v2. Three things were killing v1: the staging loop divided by a non-constant kk per element
+ * (20+ cycles each), every element was a separate 16-bit global load (2000 dependent loads a thread
+ * with no overlap, which is why even M=1 cost 4.5 ms), and the b tile was N-major so the four reads
+ * in the inner loop all landed in the same LDS bank.
+ *
+ * Now: the tile is staged with 16-byte vector loads, stored k-major as bf16 so consecutive columns
+ * are consecutive addresses, and the inner loop reads one bank per column.
+ */
+constexpr int kTM = 8;          /* rows per workgroup */
+constexpr int kTK = 32;         /* k values staged per step */
+constexpr int kThreads2 = 256;
+constexpr int kMaxN = 96;       /* the shapes that matter; the launcher refuses larger */
+constexpr int kVec = 8;         /* bf16 elements per 16-byte load */
+
+template <int DT>
+__global__ void gemm_nt_tiled(const void* __restrict__ a, const void* __restrict__ b,
+                              void* __restrict__ y, int M, int N, int K) {
+    __shared__ float s_a[kTK][kTM];         /* k-major: consecutive rows are consecutive floats */
+    __shared__ float s_b[kTK][kMaxN];
+
+    const int row0 = blockIdx.x * kTM;
+    const int rows = min(kTM, M - row0);
+    if (rows <= 0) return;
+
+    const int tid = threadIdx.x;
+    const int tpr = kThreads2 / kTM;                 /* threads per row */
+    const int tr = tid / tpr;
+    const int tc = tid - tr * tpr;
+    const int per = (N + tpr - 1) / tpr;             /* columns per thread */
+
+    float acc[4];
+    for (int i = 0; i < 4; ++i) acc[i] = 0.f;
+
+    constexpr int kStep = 4;        /* elements a thread stages per pass */
+
+    for (int k0 = 0; k0 < K; k0 += kTK) {
+        const int kk = min(kTK, K - k0);
+
+        /* b: N rows of kk values, converted once into a k-major tile. */
+        for (int i = tid * kStep; i < N * kk; i += kThreads2 * kStep) {
+            const int nn = i / kk;
+            const int cc = i - nn * kk;
+            const long long base = (long long)nn * K + k0 + cc;
+            if (cc + kStep <= kk) {
+                if (DT == RAD_BF16) {
+                    /* one 8-byte load of four bf16 */
+                    const uint2 v = *(const uint2*)((const uint16_t*)b + base);
+                    const uint16_t* h = (const uint16_t*)&v;
+                    for (int q = 0; q < 4; ++q) s_b[cc + q][nn] = bf16_to_f32(h[q]);
+                } else {
+                    const float4 v = *(const float4*)((const float*)b + base);
+                    s_b[cc + 0][nn] = v.x;
+                    s_b[cc + 1][nn] = v.y;
+                    s_b[cc + 2][nn] = v.z;
+                    s_b[cc + 3][nn] = v.w;
+                }
+            } else {
+                for (int q = 0; cc + q < kk; ++q) s_b[cc + q][nn] = ld<DT>(b, base + q);
+            }
+        }
+
+        /* a: this tile's rows, same layout. */
+        for (int i = tid * kStep; i < kTM * kk; i += kThreads2 * kStep) {
+            const int rr = i / kk;
+            const int cc = i - rr * kk;
+            for (int q = 0; q < kStep && cc + q < kk; ++q)
+                s_a[cc + q][rr] = (rr < rows) ? ld<DT>(a, (long long)(row0 + rr) * K + k0 + cc + q)
+                                               : 0.f;
+        }
+        __syncthreads();
+
+        if (tr < rows) {
+            const int c0 = tc * per;
+            const int live = min(4, N - c0);
+            for (int cc = 0; cc < kk; ++cc) {
+                const float av = s_a[cc][tr];
+                const float* bp = &s_b[cc][c0];
+                acc[0] += av * bp[0];
+                if (live > 1) acc[1] += av * bp[1];
+                if (live > 2) acc[2] += av * bp[2];
+                if (live > 3) acc[3] += av * bp[3];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tr < rows) {
+        const int c0 = tc * per;
+        const long long ybase = (long long)(row0 + tr) * N + c0;
+        for (int j = 0; j < 4 && c0 + j < N; ++j) st<DT>(y, ybase + j, acc[j]);
+    }
+}
+
 }  // namespace
 
 /* ================================================================== launchers */
@@ -317,7 +411,19 @@ extern "C" int gfx9_gemm_nt(const RadArgs* args, RadStream stream) {
     if (numel(y) < M * N) return RAD_E_SHAPE;
 
     const int n4 = (int)((N + 3) / 4);
-    const int threads = 96;                      /* 24 groups of 4 columns: one block covers N<=96 */
+
+    if (N <= kMaxN) {
+        const dim3 grid((unsigned)((M + kTM - 1) / kTM), 1, 1);
+        if (dt == RAD_BF16)
+            hipLaunchKernelGGL(gemm_nt_tiled<RAD_BF16>, grid, dim3(kThreads2), 0,
+                               (hipStream_t)stream, a->data, b->data, y->data, (int)M, (int)N, (int)K);
+        else
+            hipLaunchKernelGGL(gemm_nt_tiled<RAD_F32>, grid, dim3(kThreads2), 0,
+                               (hipStream_t)stream, a->data, b->data, y->data, (int)M, (int)N, (int)K);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
+
+    const int threads = 96;                      /* 24 groups of 4 columns */
     const dim3 grid((unsigned)((n4 + threads - 1) / threads), (unsigned)M, 1);
     if (dt == RAD_BF16)
         hipLaunchKernelGGL(gemm_nt_kernel<RAD_BF16>, grid, dim3(threads), 0, (hipStream_t)stream,

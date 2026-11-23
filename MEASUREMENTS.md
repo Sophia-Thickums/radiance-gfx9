@@ -197,3 +197,40 @@ Both are what the tiled design fixes. This number is the honest starting line, n
 `hipMemcpy` segfault inside `libamdhip64.so.7`, with a backtrace that blames the memcpy and says
 nothing about the load order. Call `hipGetDeviceCount()` first. Reproduced in isolation, both ways,
 before it was believed.
+
+## 9. The ceiling — why the 1.3x bar may be unreachable on f32
+
+Second pass on `gemm_nt` (vectorised 8-byte staging loads, k-major LDS so the four inner reads hit
+four banks, no per-element division): **0.26 TFLOP/s at M=512**, up from 0.06. Still 4.3x better and
+still nowhere.
+
+The arithmetic that matters, for the fixture's shape (`M=512 N=96 K=5120`, 0.503 GFLOP):
+
+| | TFLOP/s | of f32 peak (12.3) | of fp16 peak (24.6) |
+|---|---|---|---|
+| this kernel, second pass | 0.26 | 2% | 1% |
+| llama.cpp Vulkan, same card | ~8.6 | **70%** | 35% |
+| the bar (1.3x Vulkan) | 11.2 | **91%** | 45% |
+| ideal — no overhead at all | 12.3 | 100% | 50% |
+
+**Vulkan is already at 70% of this card's f32 peak, and the bar sits at 91%.** A hand-written kernel
+that reaches 91% of peak is not a thing that gets written in days; that is what Tensile exists for
+and what it spends thousands of generated variants to find.
+
+So the honest position:
+
+- **On f32 accumulate, this project cannot win.** The bar is above what the arithmetic units can
+  deliver with any realistic overhead.
+- **On packed fp16 it could** — the bar is 45% of the fp16 peak. But gfx900 has no
+  `v_dot2_f32_f16` (`needs target feature dot10-insts`), so the only 2x path is `v_pk_fma_f16` with
+  **fp16 accumulators**, which is a precision trade against a reference that specifies f32
+  accumulation over K=5120. Whether it passes the fixture's tolerance is testable, and that test is
+  the next thing worth spending on.
+- **And the comparison is not like for like anyway**: Vulkan there was running Q4_K_M, four bits a
+  weight, while these kernels serve bf16, four times the weight bytes. A fair bar needs either a
+  Q4 container on this engine or a bf16 baseline on Vulkan. Right now the bar flatters nobody — it
+  is simply comparing two different jobs.
+
+None of that makes the kernels wrong. They are correct, they run on both cards, and they are the
+first device code this engine has ever had for gfx900. It makes the *bar* the thing to re-examine
+before another week goes into a number that the hardware will not give up.
